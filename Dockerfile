@@ -15,6 +15,8 @@ RUN npm ci
 COPY frontend/ ./
 ARG REACT_APP_API_BASE=https://rcc-backend-671k.onrender.com/api
 ENV REACT_APP_API_BASE=$REACT_APP_API_BASE
+ARG REACT_APP_GOOGLE_CLIENT_ID=19997375921-2gilqn8bicr3tc93j66gkthbvcm88f8f.apps.googleusercontent.com
+ENV REACT_APP_GOOGLE_CLIENT_ID=$REACT_APP_GOOGLE_CLIENT_ID
 RUN npm run build
 
 # ---------- Stage 2: serve the static site with Nginx ----------
