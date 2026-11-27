@@ -121,7 +121,7 @@ selenium_tests/
   logged_in_scripts/        # 15 signed-in scripts
   Build Plan.md             # plan the suite was written from
   Assignment 01 - Selenium Webdriver.pdf
-  Muhammad Zain Resume - Autodesk.pdf   # fixture for the file input
+  Sample Resume.pdf                     # fictional resume, fixture for the file input
   Job Description - Autodesk.txt        # fixture pasted into #analyze-jd
 ```
 

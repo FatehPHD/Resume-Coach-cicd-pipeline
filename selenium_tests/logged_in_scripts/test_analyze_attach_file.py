@@ -12,7 +12,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from support.auth import login
 from support.browser import BASE, make_driver, wait
 
-RESUME = Path(__file__).resolve().parents[1] / "Muhammad Zain Resume - Autodesk.pdf"
+RESUME = Path(__file__).resolve().parents[1] / "Sample Resume.pdf"
 
 
 def test_analyze_attach_file():

@@ -15,7 +15,7 @@ from support.browser import BASE, make_driver, wait
 from support.form import set_react_value
 
 ROOT = Path(__file__).resolve().parents[1]
-RESUME = ROOT / "Muhammad Zain Resume - Autodesk.pdf"
+RESUME = ROOT / "Sample Resume.pdf"
 JOB_DESCRIPTION = ROOT / "Job Description - Autodesk.txt"
 
 

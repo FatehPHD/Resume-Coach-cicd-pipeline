@@ -37,7 +37,7 @@ Add these once. Every script imports them.
   - `ensure_account0(driver)`: signs up `rcc000000@example.test` with code `000000` and password `Rcc-test-pass-0`, and verifies it. If register answers `409` the account already exists and it exits cleanly, so the script is safe to re-run.
   - Runnable directly (`python support\bootstrap.py`). It is **not** one of the numbered test files - it is setup, and `claim_signup` deliberately never touches index 0.
 - Fixtures already in `selenium_tests/` (do not rename):
-  - `Muhammad Zain Resume - Autodesk.pdf` for the file input
+  - `Sample Resume.pdf` for the file input
   - `Job Description - Autodesk.txt` pasted into `#analyze-jd` (plain text, not the `.md`, so markdown markers are not scored)
 - `selenium_tests/support/form.py`
   - `set_react_value(driver, element_id, text)` sets a React controlled field with the native value setter and an `input` event. Do not `send_keys` the full job description; it is too slow.
@@ -154,8 +154,8 @@ Each starts with `login(driver)` (except logout, which logs in first). Account 0
 3. `test_sidebar_nav.py` - click `Analyze` (URL `/app/analyze`, `#analyze-jd` present), `Interview` (`#interview-jd`), `History` (`h1` `Your activity`), `Settings` (`h1` `Account`), `Overview` (`Welcome`).
 4. `test_new_analysis_button.py` - click `New analysis`. URL `/app/analyze`.
 5. `test_analyze_page.py` - `#analyze-resume`, `#analyze-title`, `#analyze-jd` present. Button `Analyze Resume` is disabled (`disabled` attribute) before a file is chosen.
-6. `test_analyze_attach_file.py` - `send_keys(absolute path)` of `Muhammad Zain Resume - Autodesk.pdf` on `#analyze-resume`. Dropzone text contains that filename. `Analyze Resume` is enabled. Do not click it.
-7. `test_analyze_run.py` - log in, open `/app/analyze`, upload `Muhammad Zain Resume - Autodesk.pdf`, set `#analyze-title` to `MCP/AI Developer`, paste `Job Description - Autodesk.txt` into `#analyze-jd` with `set_react_value`, click `Analyze Resume`. Wait up to 120 seconds - the app is local but the Gemini call is not. Pass when `.score-ring__num` is a number and the page shows `Overall match against this job description`. Do not assert a specific score. This is the only script that spends a real LLM call, so it needs `LLM_API_KEY` in `backend/.env`.
+6. `test_analyze_attach_file.py` - `send_keys(absolute path)` of `Sample Resume.pdf` on `#analyze-resume`. Dropzone text contains that filename. `Analyze Resume` is enabled. Do not click it.
+7. `test_analyze_run.py` - log in, open `/app/analyze`, upload `Sample Resume.pdf`, set `#analyze-title` to `MCP/AI Developer`, paste `Job Description - Autodesk.txt` into `#analyze-jd` with `set_react_value`, click `Analyze Resume`. Wait up to 120 seconds - the app is local but the Gemini call is not. Pass when `.score-ring__num` is a number and the page shows `Overall match against this job description`. Do not assert a specific score. This is the only script that spends a real LLM call, so it needs `LLM_API_KEY` in `backend/.env`.
 8. `test_interview_page.py` - heading `RCC Interview Coach`. `#interview-role`, `#interview-jd`, `#interview-context` present. `Begin interview` is disabled.
 9. `test_interview_jd_enables.py` - type `Software engineer role. Ask about React.` into `#interview-jd`. `Begin interview` becomes enabled. Do not click it.
 10. `test_history_page.py` - `h1` is `Your activity`. Then either `Nothing here yet` or at least one `.history-card`. If a card has class `history-card--clickable`, click it and assert the URL matches `/app/history/` plus an id, then a score or results heading is visible. If there is no card, that empty state is the pass. Which branch runs depends on whether `test_analyze_run.py` has already run against account 0, so both are valid expected results.
@@ -180,7 +180,7 @@ Each starts with `login(driver)` (except logout, which logs in first). Account 0
 
 ## What this covers
 
-Every real route: `/`, `/terms`, `/login`, `/signup`, `/app`, `/app/analyze`, `/app/interview`, `/app/history`, `/app/history/:id` when a card exists, `/app/settings`, plus the six legacy redirects. Signup is completed with an allowlisted `.test` address and its matching 6-digit code. No inbox, no database read, no state file. One logged-in script runs a real analysis of `Muhammad Zain Resume - Autodesk.pdf` against `Job Description - Autodesk.txt` and waits for the match score. Google sign-in, Begin interview, and account deletion are shown on screen but not executed. One script proves the escape hatch rejects an address outside the allowlist.
+Every real route: `/`, `/terms`, `/login`, `/signup`, `/app`, `/app/analyze`, `/app/interview`, `/app/history`, `/app/history/:id` when a card exists, `/app/settings`, plus the six legacy redirects. Signup is completed with an allowlisted `.test` address and its matching 6-digit code. No inbox, no database read, no state file. One logged-in script runs a real analysis of `Sample Resume.pdf` against `Job Description - Autodesk.txt` and waits for the match score. Google sign-in, Begin interview, and account deletion are shown on screen but not executed. One script proves the escape hatch rejects an address outside the allowlist.
 
 **Totals: 34 Selenium scripts** (18 logged-out, 1 signup, 15 logged-in), plus `support/bootstrap.py` as setup and 1 backend unit test file. The earlier count of 33 did not include `test_signup_rejects_unlisted.py`.
 
