@@ -1,0 +1,99 @@
+---
+- name: Prepare the app server (Docker + Minikube) - prof's D2L steps
+  hosts: app
+  become: true            # = "sudo su -": every task runs as root
+  gather_facts: false
+
+  tasks:
+    # New EC2 needs a minute before SSH works
+    - name: Wait until the server accepts SSH
+      wait_for_connection:
+        timeout: 300
+
+    # Ubuntu's first-boot setup also uses apt; wait so they don't clash
+    - name: Wait for first-boot setup to finish
+      command: cloud-init status --wait
+      changed_when: false
+
+    # Steps 1, 4, 5, 8 (the apt parts): docker.io, socat, conntrack, containerd
+    - name: Install Docker, socat, conntrack, containerd
+      apt:
+        name: [docker.io, socat, conntrack, containerd, curl]
+        state: present
+        update_cache: true
+
+    - name: Start Docker and enable it on boot
+      service:
+        name: docker
+        state: started
+        enabled: true
+
+    # Step 2: kubectl
+    - name: Install kubectl
+      shell: |
+        curl -LO https://storage.googleapis.com/kubernetes-release/release/`curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt`/bin/linux/amd64/kubectl
+        chmod +x ./kubectl
+        mv ./kubectl /usr/local/bin/kubectl
+      args:
+        chdir: /tmp
+        creates: /usr/local/bin/kubectl
+
+    # Step 3: Minikube
+    - name: Install Minikube
+      shell: |
+        curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube_latest_amd64.deb
+        dpkg -i minikube_latest_amd64.deb
+      args:
+        chdir: /tmp
+        creates: /usr/bin/minikube
+
+    # Step 4: network setting Kubernetes needs
+    - name: Enable br_netfilter and bridge networking
+      shell: |
+        modprobe br_netfilter
+        echo "net.bridge.bridge-nf-call-iptables = 1" > /etc/sysctl.d/k8s.conf
+        sysctl --system
+      changed_when: false
+
+    # Step 6: crictl
+    - name: Install crictl
+      shell: |
+        CRICTL_VERSION="v1.31.1"
+        curl -LO https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz
+        tar -C /usr/local/bin -xzf crictl-${CRICTL_VERSION}-linux-amd64.tar.gz
+        rm crictl-${CRICTL_VERSION}-linux-amd64.tar.gz
+      args:
+        chdir: /tmp
+        creates: /usr/local/bin/crictl
+
+    # Step 7: CNI network plugins
+    - name: Install CNI plugins
+      shell: |
+        CNI_PLUGIN_VERSION="v1.9.0"
+        CNI_PLUGIN_TAR="cni-plugins-linux-amd64-${CNI_PLUGIN_VERSION}.tgz"
+        mkdir -p /opt/cni/bin
+        curl -LO "https://github.com/containernetworking/plugins/releases/download/${CNI_PLUGIN_VERSION}/${CNI_PLUGIN_TAR}"
+        tar -xf "${CNI_PLUGIN_TAR}" -C /opt/cni/bin
+        rm "${CNI_PLUGIN_TAR}"
+      args:
+        chdir: /tmp
+        creates: /opt/cni/bin/bridge
+
+    # Step 8: containerd config
+    - name: Configure containerd
+      shell: |
+        mkdir -p /etc/containerd
+        containerd config default > /etc/containerd/config.toml
+        systemctl restart containerd
+      args:
+        creates: /etc/containerd/config.toml
+
+    # Step 9: start Minikube (skipped if it's already running, e.g. on later pipeline runs)
+    - name: Start Minikube
+      shell: minikube status || minikube start --driver=none
+      changed_when: false
+
+    # Step 10: make sure Kubernetes is ready before J7 runs
+    - name: Wait for Kubernetes to be ready
+      command: kubectl wait --for=condition=Ready node --all --timeout=180s
+      changed_when: false

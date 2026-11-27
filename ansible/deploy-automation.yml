@@ -1,0 +1,13 @@
+---
+- hosts: app
+  become: true
+  name: Automate Kubernetes Web Deployment on Target Node via Shell Script
+  tasks:
+    - name: Transfer and execute deployment shell script on target node
+      script: ../kubernetes/deploy-kubernetes-app.sh
+      register: script_output
+
+    - name: Output script execution logs
+      debug:
+        msg: "{{ script_output.stdout_lines }}"
+      when: script_output.stdout_lines is defined

@@ -1,0 +1,26 @@
+# ---------- Frontend (React) ----------
+frontend/node_modules/
+frontend/build/
+frontend/coverage/
+
+# ---------- Python (backend + Selenium) ----------
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.venv/
+
+# ---------- Secrets: never commit these ----------
+**/.env
+**/.env.*
+*.pem
+
+# ---------- Terraform ----------
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/.terraform.lock.hcl
+
+# ---------- OS / misc ----------
+.DS_Store
+Thumbs.db
+*.log

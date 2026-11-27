@@ -1,0 +1,170 @@
+import React, { useState } from "react";
+import { Outlet, NavLink, useNavigate, Link } from "react-router-dom";
+import RCCLogo from "./RCCLogo";
+import { useAuth } from "../context/AuthContext";
+
+const menuItems = [
+  { to: "/app", label: "Overview", icon: "grid", end: true },
+  { to: "/app/analyze", label: "Analyze", icon: "search" },
+  { to: "/app/interview", label: "Interview", icon: "mic" },
+  { to: "/app/history", label: "History", icon: "clock" },
+  { to: "/app/settings", label: "Settings", icon: "gear" },
+];
+
+const icons = {
+  grid: (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="3" width="7" height="7" />
+      <rect x="14" y="3" width="7" height="7" />
+      <rect x="3" y="14" width="7" height="7" />
+      <rect x="14" y="14" width="7" height="7" />
+    </svg>
+  ),
+  search: (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="11" cy="11" r="8" />
+      <path d="m21 21-4.35-4.35" />
+    </svg>
+  ),
+  mic: (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+      <line x1="12" y1="19" x2="12" y2="23" />
+      <line x1="8" y1="23" x2="16" y2="23" />
+    </svg>
+  ),
+  clock: (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="10" />
+      <polyline points="12 6 12 12 16 14" />
+    </svg>
+  ),
+  gear: (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+    </svg>
+  ),
+};
+
+function getInitials(nameOrEmail) {
+  if (!nameOrEmail) return "?";
+  const parts = nameOrEmail.trim().split(/\s+/);
+  if (parts.length >= 2 && /[a-zA-Z]/.test(parts[0])) {
+    return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+  }
+  return nameOrEmail.slice(0, 2).toUpperCase();
+}
+
+const DashboardLayout = ({ theme, onToggleTheme }) => {
+  const [collapsed, setCollapsed] = useState(false);
+  const { user, logout } = useAuth();
+  const navigate = useNavigate();
+
+  const handleLogout = () => {
+    logout();
+    navigate("/login");
+  };
+
+  const displayName = user?.name || user?.email || "";
+
+  return (
+    <div className={`dash-layout${collapsed ? " dash-layout--collapsed" : ""}`}>
+      <aside className="dash-sidebar">
+        <Link to="/" className="dash-sidebar__header dash-sidebar__home-link">
+          <RCCLogo size={28} showWordmark={!collapsed} />
+        </Link>
+
+        <button
+          type="button"
+          className="dash-sidebar__new"
+          onClick={() => navigate("/app/analyze")}
+          title="New analysis"
+        >
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19" />
+            <line x1="5" y1="12" x2="19" y2="12" />
+          </svg>
+          {!collapsed && <span>New analysis</span>}
+        </button>
+
+        <nav className="dash-sidebar__nav">
+          {menuItems.map((item) => (
+            <NavLink
+              key={item.to}
+              to={item.to}
+              end={item.end}
+              className="dash-sidebar__link"
+            >
+              <span className="dash-sidebar__link-icon">{icons[item.icon]}</span>
+              {!collapsed && <span>{item.label}</span>}
+            </NavLink>
+          ))}
+        </nav>
+
+        <div className="dash-sidebar__footer">
+          {user && (
+            <div className="dash-sidebar__user">
+              <span className="dash-sidebar__avatar" aria-hidden="true">
+                {getInitials(displayName)}
+              </span>
+              {!collapsed && (
+                <div className="dash-sidebar__user-meta">
+                  <span className="dash-sidebar__user-name" title={displayName}>
+                    {user.name || user.email}
+                  </span>
+                  <button
+                    type="button"
+                    className="dash-sidebar__logout"
+                    onClick={handleLogout}
+                  >
+                    Log out
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          <button
+            type="button"
+            className="theme-toggle"
+            onClick={onToggleTheme}
+            aria-label={`Switch to ${theme === "light" ? "dark" : "light"} mode`}
+          >
+            <span className="theme-toggle__track" aria-hidden="true">
+              <span className="theme-toggle__thumb" />
+            </span>
+            {!collapsed && (
+              <span className="theme-toggle__label">
+                {theme === "light" ? "Light" : "Dark"}
+              </span>
+            )}
+          </button>
+
+          <button
+            type="button"
+            className="dash-sidebar__collapse-btn"
+            onClick={() => setCollapsed((c) => !c)}
+            aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          >
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              {collapsed
+                ? <polyline points="9 18 15 12 9 6" />
+                : <polyline points="15 18 9 12 15 6" />}
+            </svg>
+          </button>
+        </div>
+      </aside>
+
+      <main className="dash-main">
+        <div className="dash-main__bg" aria-hidden="true" />
+        <div className="dash-main__inner">
+          <Outlet />
+        </div>
+      </main>
+    </div>
+  );
+};
+
+export default DashboardLayout;

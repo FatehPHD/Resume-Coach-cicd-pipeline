@@ -1,0 +1,14 @@
+flask
+gunicorn
+flask-cors
+flask-jwt-extended
+flask-limiter
+flask-mail
+authlib
+google-auth
+psycopg2-binary
+python-dotenv
+requests
+pdfplumber
+pypdf
+python-docx

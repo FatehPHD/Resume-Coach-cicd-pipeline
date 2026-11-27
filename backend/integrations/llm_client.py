@@ -1,0 +1,629 @@
+from __future__ import annotations
+import json
+import logging
+import re
+from typing import Any
+import requests
+
+from config import Config
+from services.analysis_service import analyze_resume_against_job
+
+logger = logging.getLogger(__name__)
+
+_MAX_CHARS = 12_000
+_REQUEST_TIMEOUT = 60
+
+# A weak model is more reliable at low temperature on structured output.
+_ANALYSIS_TEMPERATURE = 0.2
+
+# Priority ordering so the most important suggestions surface first.
+_PRIORITY_RANK = {"high": 0, "medium": 1, "low": 2}
+
+# Detects quantified achievements: 40%, $2M, 1,200 users, 3x, 10k, "by 25".
+_QUANT_RE = re.compile(
+    r"(\d+\s?%|\$\s?\d|\d[\d,]*\s?(k|m|bn|x|hrs?|days?|users?|customers?|requests?)\b|\bby\s+\d|\d[\d,]{2,})",
+    re.IGNORECASE,
+)
+
+
+def _clean_text(text: str) -> str:
+    """Strip control chars and collapse whitespace so the model sees clean input."""
+    if not text:
+        return ""
+    text = text.replace("\x00", " ")
+    # Collapse runs of blank lines / spaces but keep single newlines for structure.
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _count_quantified_bullets(resume_text: str) -> int:
+    """Deterministic count of resume lines that contain a real metric.
+
+    Used to ground the LLM's impact_metrics score in reality - a weak model
+    often over- or under-rates this, so we bound it with a hard signal.
+    """
+    count = 0
+    for line in (resume_text or "").splitlines():
+        line = line.strip()
+        if len(line) < 12:
+            continue
+        if _QUANT_RE.search(line):
+            count += 1
+    return count
+
+# ---------------------------------------------------------------------------
+# Fallback suggestions (used when LLM is unavailable)
+# ---------------------------------------------------------------------------
+_FALLBACK_SUGGESTIONS = [
+    {
+        "category": "Impact Metrics",
+        "section": "Experience",
+        "text": "Add measurable outcomes (metrics, scale, timelines) to your strongest bullet points. For example, change 'Improved performance' to 'Improved API response time by 40%, reducing p95 latency from 800ms to 480ms'.",
+        "priority": "high",
+    },
+    {
+        "category": "Missing Keyword",
+        "section": "Experience",
+        "text": "Mirror important job keywords naturally in your experience section so ATS systems can pick them up.",
+        "priority": "high",
+    },
+    {
+        "category": "Bullet Improvement",
+        "section": "Projects",
+        "text": "Surface projects that directly match the role's technical requirements and describe them with action + context + result (STAR-style) wording.",
+        "priority": "medium",
+    },
+    {
+        "category": "Section Order",
+        "section": "Skills",
+        "text": "Move the most relevant skills and tools closer to the top of the resume so recruiters see them first.",
+        "priority": "medium",
+    },
+    {
+        "category": "Formatting",
+        "section": "General",
+        "text": "Replace vague phrases like 'Worked on' or 'Helped with' with strong action verbs such as 'Engineered', 'Architected', or 'Optimized'.",
+        "priority": "low",
+    },
+]
+
+_SCORE_WEIGHTS = {
+    # "Does the candidate fit the role" matters more than raw keyword overlap,
+    # so requirements_match leads and keyword_match is deliberately not dominant.
+    "requirements_match": 0.30,
+    "keyword_match": 0.22,
+    "impact_metrics": 0.16,
+    "formatting": 0.12,
+    "spelling_grammar": 0.10,
+    "section_order": 0.10,
+}
+
+_VALID_REQ_STATUS = {"met", "missing", "unclear"}
+
+STOPWORDS = set([
+    "is", "are", "the", "of", "and", "or", "a", "about", "an", "into", "for", "with",
+    "as", "at", "on", "in", "by", "from", "to", ".", ",", "ll", "re", "include",
+    "product", "part", "original", "high", "large", "next", "all", "description",
+    "experience", "education", "skills", "projects", "across", "using", "used",
+    "work", "working", "team", "role", "job", "year", "years", "professional",
+    "strong", "excellent", "good", "best", "practices", "knowledge", "ability",
+    "understanding", "communication", "leadership", "development", "management",
+    "environment", "application", "system", "process", "service", "support",
+    "information", "technology", "quality", "standard", "business", "customer",
+    "client", "solution", "tools", "platform", "framework", "engineering",
+    "software", "hardware", "performance", "operations", "strategy",
+    "learning", "training", "analysis", "report", "reporting", "documentation",
+    "building", "maintaining", "testing", "design", "implementation",
+    "deployment", "delivery", "improvement", "research", "collaboration",
+    "initiative", "profile", "technical", "detail",
+])
+
+
+def filter_skills(skills: list[str]) -> list[str]:
+    filtered = []
+    for s in skills:
+        s_clean = s.strip().lower()
+        if not s_clean or s_clean in STOPWORDS or len(s_clean) < 3:
+            continue
+        filtered.append(s)
+    return filtered[:50]
+
+
+def _fallback_bundle(overlap: dict) -> dict:
+    base_score = overlap["match_score"]
+    return {
+        "match_score": base_score,
+        "score_breakdown": {
+            "keyword_match": round(base_score),
+            "requirements_match": 50,
+            "formatting": 50,
+            "spelling_grammar": 50,
+            "impact_metrics": 50,
+            "section_order": 50,
+        },
+        "matched_skills": overlap["matched_skills"],
+        "missing_skills": filter_skills(overlap["missing_skills"]),
+        "hard_requirements": [],
+        "suggestions": list(_FALLBACK_SUGGESTIONS),
+    }
+
+
+def _coerce_hard_requirements(raw: Any) -> list[dict]:
+    """Normalize the model's hard-requirement findings (eligibility, etc.)."""
+    out = []
+    for r in raw or []:
+        if not isinstance(r, dict):
+            continue
+        req = str(r.get("requirement", "")).strip()
+        if not req:
+            continue
+        status = str(r.get("status", "unclear")).strip().lower()
+        if status not in _VALID_REQ_STATUS:
+            status = "unclear"
+        note = str(r.get("note", "")).strip()
+        out.append({
+            "requirement": req[:200],
+            "status": status,
+            "note": note[:300],
+        })
+    return out[:10]
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    text = (text or "").strip()
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE)
+    if fence:
+        text = fence.group(1).strip()
+    return json.loads(text)
+
+
+def _coerce_suggestion(raw: Any) -> dict | None:
+    """Normalize a suggestion into the structured format."""
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        return {
+            "category": "General",
+            "section": "General",
+            "text": s,
+            "priority": "medium",
+        }
+    if isinstance(raw, dict):
+        text = str(raw.get("text", "")).strip()
+        if not text:
+            return None
+        return {
+            "category": str(raw.get("category", "General")).strip() or "General",
+            "section": str(raw.get("section", "General")).strip() or "General",
+            "text": text,
+            "priority": str(raw.get("priority", "medium")).strip().lower() or "medium",
+        }
+    return None
+
+
+def _compute_overall(breakdown: dict) -> float:
+    """Weighted average of the six sub-scores.
+
+    keyword_match is already grounded against the curated JD skill set (see
+    _curated_overlap), so we no longer blend in a separate raw-overlap baseline
+    - doing so used to let a naive token count drag good candidates down.
+    """
+    total = 0.0
+    for key, weight in _SCORE_WEIGHTS.items():
+        val = breakdown.get(key)
+        if val is None:
+            val = 50.0
+        total += float(val) * weight
+    return round(max(0, min(100, total)), 2)
+
+
+def _structure_job_description(job_description: str) -> dict | None:
+    """Normalize a raw job posting into a clean, canonical skill set FIRST.
+
+    A long JD is full of filler and nice-to-haves. Scoring keyword overlap
+    against the raw posting unfairly punishes strong candidates (the classic
+    "legacy keyword counter" failure). By having the model distill the posting
+    into required vs. preferred skills up front, we can ground keyword_match on
+    what the role actually demands instead of every noun in the text.
+
+    Returns lowercase skill lists, or None if the call/parse fails.
+    """
+    system = (
+        "You distill a raw job description into a clean, structured summary. "
+        "Return ONE JSON object, no markdown, no prose:\n"
+        "{\n"
+        '  "required_skills": ["canonical skill/tool/concept the role genuinely requires"],\n'
+        '  "preferred_skills": ["nice-to-have skills the JD frames as optional/bonus/plus"]\n'
+        "}\n\n"
+        "RULES:\n"
+        "- Normalize to canonical lowercase names: 'React.js'->'react', 'JS'->'javascript', "
+        "'user centered design'->'ux design', 'RAG'->'retrieval augmented generation'.\n"
+        "- required_skills: only genuine expectations. Merge synonyms, drop generic "
+        "filler ('communication', 'teamwork', 'fast-paced'). Aim for 8-20 items.\n"
+        "- preferred_skills: anything the JD marks as 'nice to have', 'bonus', 'a plus', "
+        "'exposure to', or a specific tool among alternatives (e.g. Figma/Miro/Adobe XD). "
+        "A skill the candidate is only expected to be ABLE TO LEARN is preferred, not required.\n"
+        "- Keep preferred items OUT of required_skills."
+    )
+    user = f"JOB DESCRIPTION:\n{job_description[:_MAX_CHARS]}"
+    try:
+        content = _chat_completion(
+            [{"role": "system", "content": system},
+             {"role": "user", "content": user}]
+        )
+        data = _extract_json_object(content)
+    except (requests.RequestException, json.JSONDecodeError, ValueError, KeyError):
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    def _clean(items: Any) -> list[str]:
+        out: list[str] = []
+        for x in items or []:
+            s = str(x).strip().lower()
+            if s and s not in out:
+                out.append(s)
+        return out[:40]
+
+    required = _clean(data.get("required_skills"))
+    preferred = [s for s in _clean(data.get("preferred_skills")) if s not in required]
+    if not required and not preferred:
+        return None
+    return {"required_skills": required, "preferred_skills": preferred}
+
+
+def _skill_present(skill: str, resume_lower: str) -> bool:
+    """Word-boundary match of a (possibly multi-word) skill in the resume text.
+
+    Boundaries avoid false hits like 'react' inside 'reactive', while still
+    letting tech tokens with symbols (c++, ci/cd, .net) match."""
+    s = skill.strip().lower()
+    if not s:
+        return False
+    pattern = r"(?<![a-z0-9])" + re.escape(s) + r"(?![a-z0-9+#])"
+    return re.search(pattern, resume_lower) is not None
+
+
+def _curated_overlap(resume_text: str, structured: dict) -> dict:
+    """Ground keyword coverage on the curated skill set, not raw token soup.
+
+    Required skills drive the score; preferred skills add a small capped bonus
+    so a candidate is never dragged down merely for lacking nice-to-haves.
+    """
+    resume_lower = (resume_text or "").lower()
+    required = structured.get("required_skills") or []
+    preferred = structured.get("preferred_skills") or []
+
+    matched_req = [s for s in required if _skill_present(s, resume_lower)]
+    missing_req = [s for s in required if s not in matched_req]
+    matched_pref = [s for s in preferred if _skill_present(s, resume_lower)]
+
+    if required:
+        base = len(matched_req) / len(required)
+        bonus = 0.10 * (len(matched_pref) / len(preferred)) if preferred else 0.0
+        coverage = round(min(1.0, base + bonus) * 100, 2)
+    else:
+        coverage = None
+
+    matched = matched_req + [s for s in matched_pref if s not in matched_req]
+    return {
+        "coverage": coverage,
+        "matched_skills": matched,
+        "missing_skills": missing_req,
+    }
+
+
+def _coerce_analysis_payload(
+    raw: dict[str, Any],
+    det_kw: float,
+    matched_skills: list[str],
+    missing_fallback: list[str],
+    quantified: int = 0,
+) -> dict | None:
+    try:
+        raw_breakdown = raw.get("score_breakdown") or {}
+        breakdown = {}
+        for key in _SCORE_WEIGHTS:
+            val = raw_breakdown.get(key)
+            if val is not None:
+                breakdown[key] = max(0, min(100, float(val)))
+            elif key == "keyword_match":
+                breakdown[key] = float(det_kw)
+            else:
+                breakdown[key] = 50.0
+
+        # Ground keyword_match in the curated skill coverage so a weak model
+        # can't drift too far from the real keyword reality.
+        breakdown["keyword_match"] = round(
+            0.5 * breakdown["keyword_match"] + 0.5 * float(det_kw), 2
+        )
+
+        # Bound impact_metrics by the real count of quantified bullets - the
+        # single most-hallucinated sub-score on a low-end model.
+        if quantified <= 0:
+            breakdown["impact_metrics"] = min(breakdown["impact_metrics"], 45.0)
+        elif quantified >= 4:
+            breakdown["impact_metrics"] = max(breakdown["impact_metrics"], 60.0)
+
+        match_score = _compute_overall(breakdown)
+
+        missing_skills = filter_skills(raw.get("missing_skills") or [])
+
+        raw_suggestions = raw.get("suggestions") or []
+        suggestions = []
+        seen = set()
+        for s in raw_suggestions:
+            coerced = _coerce_suggestion(s)
+            if not coerced:
+                continue
+            # Drop near-duplicates and vague one-liners a weak model tends to emit.
+            text = coerced["text"]
+            key = text.lower()[:60]
+            if key in seen or len(text) < 15:
+                continue
+            seen.add(key)
+            if coerced["priority"] not in _PRIORITY_RANK:
+                coerced["priority"] = "medium"
+            suggestions.append(coerced)
+
+        # Most important first.
+        suggestions.sort(key=lambda s: _PRIORITY_RANK.get(s["priority"], 1))
+        suggestions = suggestions[:12]
+
+        if not suggestions:
+            return None
+
+        if not missing_skills:
+            missing_skills = filter_skills(missing_fallback)
+
+        hard_requirements = _coerce_hard_requirements(raw.get("hard_requirements"))
+
+        return {
+            "match_score": match_score,
+            "score_breakdown": breakdown,
+            "matched_skills": matched_skills,
+            "missing_skills": missing_skills,
+            "hard_requirements": hard_requirements,
+            "suggestions": suggestions,
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def _chat_completion(
+    messages: list[dict[str, str]],
+    json_mode: bool = True,
+    temperature: float = _ANALYSIS_TEMPERATURE,
+) -> str:
+    url = f"{Config.LLM_BASE_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {Config.LLM_API_KEY.strip()}",
+        "Content-Type": "application/json",
+    }
+    payload: dict[str, Any] = {
+        "model": Config.LLM_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if json_mode:
+        # Gemini's OpenAI-compatible endpoint honours structured output. This
+        # makes _extract_json_object succeed far more often, so real analysis
+        # shows up instead of the generic fallback bundle.
+        payload["response_format"] = {"type": "json_object"}
+    resp = requests.post(url, headers=headers, json=payload, timeout=_REQUEST_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    return (data["choices"][0]["message"].get("content") or "").strip()
+
+
+def pack_analysis_for_db(payload: dict) -> str:
+    """Serialize the full analysis payload for one DB column."""
+    return json.dumps(
+        {
+            "matched_skills": payload.get("matched_skills", []),
+            "missing_skills": payload.get("missing_skills", []),
+            "suggestions": payload.get("suggestions", []),
+            "score_breakdown": payload.get("score_breakdown", {}),
+            "hard_requirements": payload.get("hard_requirements", []),
+        },
+        ensure_ascii=False,
+    )
+
+
+def unpack_analysis_from_db(raw: str | None) -> dict:
+    """Reverse of pack_analysis_for_db. Supports legacy plain-text rows."""
+    empty = {
+        "matched_skills": [],
+        "missing_skills": [],
+        "suggestions": [],
+        "score_breakdown": {},
+        "hard_requirements": [],
+    }
+    if not raw or not str(raw).strip():
+        return empty
+
+    text = str(raw).strip()
+    if text.startswith("{"):
+        try:
+            data = json.loads(text)
+            suggestions = []
+            for s in (data.get("suggestions") or []):
+                coerced = _coerce_suggestion(s)
+                if coerced:
+                    suggestions.append(coerced)
+
+            return {
+                "matched_skills": list(data.get("matched_skills") or []),
+                "missing_skills": list(data.get("missing_skills") or []),
+                "suggestions": suggestions,
+                "score_breakdown": data.get("score_breakdown") or {},
+                "hard_requirements": _coerce_hard_requirements(
+                    data.get("hard_requirements")
+                ),
+            }
+        except json.JSONDecodeError:
+            pass
+
+    lines = [s.strip() for s in text.split("\n") if s.strip()]
+    legacy_suggestions = []
+    for line in lines:
+        coerced = _coerce_suggestion(line)
+        if coerced:
+            legacy_suggestions.append(coerced)
+    return {
+        "matched_skills": [],
+        "missing_skills": [],
+        "suggestions": legacy_suggestions,
+        "score_breakdown": {},
+        "hard_requirements": [],
+    }
+
+
+def analyze_resume_job(resume_text: str, job_description: str) -> dict:
+    """
+    Hybrid overlap + LLM analysis with multi-dimensional scoring
+    and structured, section-specific suggestions.
+    """
+    resume_text = _clean_text(resume_text)
+    job_description = _clean_text(job_description)
+    overlap = analyze_resume_against_job(resume_text, job_description)
+    quantified = _count_quantified_bullets(resume_text)
+
+    if not Config.LLM_API_KEY or not Config.LLM_API_KEY.strip():
+        return _fallback_bundle(overlap)
+
+    # STEP 1 - restructure the JD before scoring anything. This yields a clean
+    # required/preferred skill set so keyword_match reflects the skills the role
+    # actually demands, not raw token overlap against the whole posting.
+    structured = _structure_job_description(job_description)
+    if structured:
+        curated = _curated_overlap(resume_text, structured)
+    else:
+        curated = {"coverage": None, "matched_skills": [], "missing_skills": []}
+
+    if curated["coverage"] is not None:
+        det_kw = curated["coverage"]
+        matched_display = curated["matched_skills"]
+        missing_display = curated["missing_skills"]
+    else:
+        # Structuring unavailable - fall back to the raw deterministic overlap.
+        det_kw = overlap["match_score"]
+        matched_display = overlap["matched_skills"]
+        missing_display = overlap["missing_skills"]
+
+    r_short = resume_text[:_MAX_CHARS]
+    j_short = job_description[:_MAX_CHARS]
+
+    system = (
+        "You are an expert technical recruiter and resume analyst. Judge the resume "
+        "against the job description the way a real hiring manager and ATS would - "
+        "looking at the WHOLE candidate, not just keyword overlap.\n\n"
+        "Return ONE JSON object with this exact schema (no markdown, no prose):\n"
+        "{\n"
+        '  "score_breakdown": {\n'
+        '    "keyword_match": <0-100>,\n'
+        '    "requirements_match": <0-100>,\n'
+        '    "impact_metrics": <0-100>,\n'
+        '    "formatting": <0-100>,\n'
+        '    "spelling_grammar": <0-100>,\n'
+        '    "section_order": <0-100>\n'
+        "  },\n"
+        '  "missing_skills": ["string", ...],\n'
+        '  "hard_requirements": [\n'
+        "    {\n"
+        '      "requirement": "a concrete must-have from the JD (e.g. US work authorization, '
+        '5+ years experience, bachelor\'s in CS, security clearance, on-site in Berlin, valid license)",\n'
+        '      "status": "met | missing | unclear",\n'
+        '      "note": "one short sentence on why, citing the resume"\n'
+        "    }\n"
+        "  ],\n"
+        '  "suggestions": [\n'
+        "    {\n"
+        '      "category": "Section Order | Bullet Improvement | Missing Keyword | Formatting | Spelling | Impact Metrics | Requirement",\n'
+        '      "section": "which resume section (e.g. Skills, Experience > Job Title, Projects > Project Name, Education)",\n'
+        '      "text": "specific actionable instruction with before/after examples where applicable",\n'
+        '      "priority": "high | medium | low"\n'
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "SCORING RULES:\n"
+        "- keyword_match: of the REQUIRED skills the role demands, what share does the resume "
+        "evidence? Judge semantically, not by exact string: 'React, component-based design, Figma, "
+        "Human-Computer Interaction coursework' clearly covers 'user-centered design' and 'UX "
+        "principles'. Do NOT penalize a candidate for not copying the JD's exact phrasing, and do "
+        "NOT count nice-to-have tools they happen to lack against this score.\n"
+        "- requirements_match: how well the candidate meets the JD's HARD requirements - "
+        "years of experience, required degree/field, certifications/licenses, work authorization or "
+        "citizenship, security clearance, location/relocation/on-site, seniority level, domain experience. "
+        "If the JD demands something the resume does not evidence, this score drops sharply. "
+        "A perfect keyword match with unmet hard requirements is NOT a strong candidate.\n"
+        "- impact_metrics: presence of quantifiable results (numbers, %, $, scale). "
+        "Score low if bullets say 'Worked on X' with no measurable outcome.\n"
+        "- formatting: consistent bullets, clear section headers, appropriate length, clean whitespace, "
+        "logical structure that an ATS can parse.\n"
+        "- spelling_grammar: typos, grammar, inconsistent tense.\n"
+        "- section_order: sections ordered appropriately for career level; skills positioned for visibility.\n\n"
+        "HARD REQUIREMENTS RULES:\n"
+        "- Extract every genuine must-have from the JD (eligibility, experience, education, certs, "
+        "clearance, location, language). List 3-8 of the most important.\n"
+        "- Judge understanding/knowledge requirements HOLISTICALLY: relevant coursework, projects, "
+        "or listed skills count as 'met'. A candidate with HCI coursework, React projects, and Figma "
+        "listed MEETS 'understanding of user-centered design and UX principles' - do not mark it "
+        "'unclear' just because the resume doesn't restate the JD's exact words.\n"
+        "- Mark status 'missing' only when the JD clearly requires it AND the resume shows no evidence. "
+        "Reserve 'unclear' for facts a resume genuinely cannot show (citizenship, clearance, exact "
+        "availability/hours), NOT for skills that can be reasonably inferred. Never invent requirements.\n"
+        "- For each 'missing' or 'unclear' hard requirement, also add a matching suggestion with "
+        'category "Requirement" and priority "high" telling the user how to address it.\n\n'
+        "SUGGESTION RULES:\n"
+        "- Provide 5-12 suggestions, each referencing a SPECIFIC section and location in the resume.\n"
+        "- For Bullet Improvement, quote the original bullet text and show an improved version.\n"
+        "- For Section Order, say exactly which section to move and where.\n"
+        "- For Missing Keyword, say where to naturally weave in the missing term.\n"
+        "- missing_skills: only real technical terms (tools, languages, frameworks, platforms, certifications). "
+        "Do NOT include generic words like 'experience', 'knowledge', 'skills'.\n"
+        "- Scale: 0-40 unrelated, 40-70 partial match, 70-90 good, 90-100 near-perfect.\n\n"
+        "EXAMPLE of one well-formed suggestion object (match this shape and specificity):\n"
+        '{"category": "Bullet Improvement", "section": "Experience > Backend Engineer", '
+        '"text": "Rewrite \'Worked on the payments API\' as \'Built a payments API handling '
+        '12k req/min, cutting checkout errors 30%\'.", "priority": "high"}\n'
+    )
+
+    req_skills = (structured or {}).get("required_skills", [])
+    pref_skills = (structured or {}).get("preferred_skills", [])
+    user = (
+        f"STRUCTURED JOB DESCRIPTION (extracted first, use it to score keyword_match):\n"
+        f"- Required skills the role demands: {req_skills}\n"
+        f"- Preferred / nice-to-have skills: {pref_skills}\n\n"
+        f"DETERMINISTIC HINTS (ground your scores in these, do not contradict them):\n"
+        f"- Required-skill coverage in the resume: {det_kw}%\n"
+        f"- Required skills present in the resume: {matched_display[:30]}\n"
+        f"- Required skills NOT found in the resume: {missing_display[:30]}\n"
+        f"- Resume bullets containing a real metric/number: {quantified}\n\n"
+        f"RESUME:\n{r_short}\n\nJOB DESCRIPTION:\n{j_short}"
+    )
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+    # One retry on a parse/transport flub before dropping to the fallback -
+    # a single reroll fixes most flukes and keeps real analysis showing up.
+    for attempt in range(2):
+        try:
+            content = _chat_completion(messages)
+            parsed = _extract_json_object(content)
+            merged = _coerce_analysis_payload(
+                parsed, det_kw, matched_display, missing_display, quantified
+            )
+            if merged:
+                return merged
+            logger.warning("LLM analysis payload unusable (attempt %d).", attempt + 1)
+        except (requests.RequestException, json.JSONDecodeError):
+            logger.warning("LLM call/parse failed (attempt %d).", attempt + 1)
+
+    logger.warning("LLM analysis unavailable; using fallback analysis.")
+    return _fallback_bundle(overlap)
